@@ -20,6 +20,7 @@
 #include "sql/resolver/dml/ob_dml_resolver.h"
 #include "sql/engine/expr/ob_expr_version.h"
 #include "sql/rewrite/ob_transform_pre_process.h"
+#include "lib/utility/ob_sort.h"
 
 namespace oceanbase
 {
@@ -28,6 +29,24 @@ using namespace common;
 
 namespace sql
 {
+namespace
+{
+struct InlistValuesRowKey
+{
+  uint64_t hash_;
+  int64_t row_idx_;
+};
+struct InlistValuesRowKeyCmp
+{
+  bool operator()(const InlistValuesRowKey &left, const InlistValuesRowKey &right) const
+  {
+    return left.hash_ != right.hash_ ? left.hash_ < right.hash_
+                                     : left.row_idx_ < right.row_idx_;
+  }
+};
+const uint64_t INLIST_VALUES_NULL_COLUMN_HASH = 0;
+}  // anonymous namespace
+
 struct InListRewriteInfo {
   bool is_valid_as_values_table_;
   bool is_question_mark_;
@@ -129,6 +148,7 @@ int ObInListResolver::resolve_values_table_from_inlist(const ParseNode *in_list,
   } else if (ObValuesTableDef::ACCESS_OBJ == access_type &&
              OB_FAIL(resolve_access_obj_values_table(*in_list, column_cnt, row_cnt, session_info,
                                                      allocator, is_prepare_stage, is_called_in_sql, *table_def))) {
+  } else if (OB_FAIL(dedup_const_values_table_rows(*table_def))) {
   } else if (OB_FAIL(cur_resolver_->estimate_values_table_stats(*table_def))) {
   }
   return ret;
@@ -503,6 +523,139 @@ int ObInListResolver::resolve_access_obj_values_table(const ParseNode &in_list,
           } else {
             table_def.column_types_.at(j) = new_res_type;
           }
+        }
+      }
+    }
+  }
+  return ret;
+}
+
+// Deduplicate identical rows of the constant values table built from an
+// IN-list (ACCESS_OBJ). IN/NOT IN membership does not change when duplicated
+// constant rows are removed, while every duplicated row multiplies the cost
+// paid by the semi-join and the vector-index pre-filter that consume the
+// values table (oceanbase/seekdb#1512). Only the constant ACCESS_OBJ table is
+// deduplicated: question-mark and param-backed lists cannot be deduplicated at
+// resolve time. Rows are duplicates when every column object compares equal
+// with ObObj::operator==, so each removed row is interchangeable with its kept
+// representative, and the original row order of the kept rows is preserved.
+int ObInListResolver::dedup_const_values_table_rows(ObValuesTableDef &table_def)
+{
+  int ret = OB_SUCCESS;
+  bool can_dedup = true;
+  if (ObValuesTableDef::ACCESS_OBJ != table_def.access_type_
+      || table_def.column_cnt_ <= 0
+      || table_def.row_cnt_ <= 1) {
+    // nothing to deduplicate
+    can_dedup = false;
+  } else if (OB_UNLIKELY(table_def.access_objs_.count()
+                         != table_def.row_cnt_ * table_def.column_cnt_)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("unexpected constant values table object count", K(ret), K(table_def));
+  } else {
+    const int64_t column_cnt = table_def.column_cnt_;
+    const int64_t row_cnt = table_def.row_cnt_;
+    ObArray<InlistValuesRowKey> row_keys;
+    if (OB_FAIL(row_keys.reserve(row_cnt))) {
+      LOG_WARN("reserve row keys failed", K(ret), K(row_cnt));
+    }
+    for (int64_t row_idx = 0; OB_SUCC(ret) && can_dedup && row_idx < row_cnt; ++row_idx) {
+      uint64_t row_hash = 0;
+      for (int64_t col_idx = 0; OB_SUCC(ret) && can_dedup && col_idx < column_cnt; ++col_idx) {
+        const ObObjParam &obj = table_def.access_objs_.at(row_idx * column_cnt + col_idx);
+        uint64_t col_hash = INLIST_VALUES_NULL_COLUMN_HASH;
+        if (obj.is_unknown()) {
+          // prepare-stage placeholders are bound later, one row per parameter,
+          // and must never be collapsed
+          can_dedup = false;
+        } else if (obj.is_null()) {
+          // keep the marker so NULL rows group together and never group with a
+          // non-NULL row that happens to hash to the same marker
+          col_hash = INLIST_VALUES_NULL_COLUMN_HASH;
+        } else if (obj.is_string_type()) {
+          col_hash = obj.varchar_hash(obj.get_collation_type(), col_hash);
+        } else if (OB_SUCCESS != obj.hash(col_hash, col_hash)) {
+          // exotic constant types: leave the values table untouched rather
+          // than pair the bucket hash with a different equality
+          can_dedup = false;
+        } else { /* hash computed */ }
+        if (can_dedup) {
+          row_hash = row_hash * 1000003ULL + col_hash;
+        }
+      }
+      if (OB_SUCC(ret) && can_dedup) {
+        InlistValuesRowKey key;
+        key.hash_ = row_hash;
+        key.row_idx_ = row_idx;
+        if (OB_FAIL(row_keys.push_back(key))) {
+          LOG_WARN("push back row key failed", K(ret));
+        }
+      }
+    }
+    if (OB_FAIL(ret) || !can_dedup) {
+      // keep the values table untouched
+    } else if (OB_UNLIKELY(row_keys.count() != row_cnt)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("unexpected row key count", K(ret), K(row_cnt), K(row_keys.count()));
+    } else {
+      lib::ob_sort(row_keys.begin(), row_keys.end(), InlistValuesRowKeyCmp());
+      ObArray<int64_t> kept_rows;
+      if (OB_FAIL(kept_rows.reserve(row_cnt))) {
+        LOG_WARN("reserve kept rows failed", K(ret), K(row_cnt));
+      }
+      int64_t group_begin = 0;
+      while (OB_SUCC(ret) && group_begin < row_keys.count()) {
+        int64_t group_end = group_begin + 1;
+        while (group_end < row_keys.count()
+               && row_keys.at(group_end).hash_ == row_keys.at(group_begin).hash_) {
+          ++group_end;
+        }
+        for (int64_t i = group_begin; OB_SUCC(ret) && i < group_end; ++i) {
+          const int64_t row_idx = row_keys.at(i).row_idx_;
+          bool is_duplicate = false;
+          for (int64_t j = group_begin; !is_duplicate && j < i; ++j) {
+            const int64_t other_idx = row_keys.at(j).row_idx_;
+            bool row_equal = true;
+            for (int64_t col_idx = 0; row_equal && col_idx < column_cnt; ++col_idx) {
+              row_equal = (table_def.access_objs_.at(row_idx * column_cnt + col_idx)
+                           == table_def.access_objs_.at(other_idx * column_cnt + col_idx));
+            }
+            is_duplicate = row_equal;
+          }
+          if (OB_SUCC(ret) && !is_duplicate
+              && OB_FAIL(kept_rows.push_back(row_idx))) {
+            LOG_WARN("push back kept row failed", K(ret));
+          }
+        }
+        group_begin = group_end;
+      }
+      if (OB_FAIL(ret) || kept_rows.count() == row_cnt) {
+        // nothing duplicated
+      } else if (OB_UNLIKELY(kept_rows.count() <= 0)) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("no kept row", K(ret), K(row_cnt));
+      } else {
+        lib::ob_sort(kept_rows.begin(), kept_rows.end());
+        ObArray<ObObjParam> dedup_objs;
+        if (OB_FAIL(dedup_objs.reserve(kept_rows.count() * column_cnt))) {
+          LOG_WARN("reserve dedup objs failed", K(ret), K(kept_rows.count()), K(column_cnt));
+        }
+        for (int64_t i = 0; OB_SUCC(ret) && i < kept_rows.count(); ++i) {
+          const int64_t row_idx = kept_rows.at(i);
+          for (int64_t col_idx = 0; OB_SUCC(ret) && col_idx < column_cnt; ++col_idx) {
+            if (OB_FAIL(dedup_objs.push_back(
+                    table_def.access_objs_.at(row_idx * column_cnt + col_idx)))) {
+              LOG_WARN("push back dedup obj failed", K(ret));
+            }
+          }
+        }
+        if (OB_FAIL(ret)) {
+        } else if (OB_FAIL(table_def.access_objs_.assign(dedup_objs))) {
+          LOG_WARN("assign dedup objs failed", K(ret));
+        } else {
+          LOG_TRACE("deduplicated constant inlist values table rows",
+                    K(row_cnt), "dedup_cnt", kept_rows.count(), K(column_cnt));
+          table_def.row_cnt_ = kept_rows.count();
         }
       }
     }

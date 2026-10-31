@@ -1,0 +1,100 @@
+# owner: 0G-Bhqc
+# owner group: SQL3
+# tags: optimizer
+
+--result_format 4
+--disable_abort_on_error
+--disable_warnings
+drop table if exists inlist_dedup_t;
+drop table if exists digits;
+--enable_warnings
+
+create table digits (d int primary key);
+insert into digits values (0),(1),(2),(3),(4),(5),(6),(7),(8),(9);
+
+create table inlist_dedup_t (id int primary key, c1 int, c2 varchar(16));
+insert into inlist_dedup_t values (1,1,'a'),(2,2,'b'),(3,3,'c'),(4,4,'d'),(5,1,'e'),(6,2,'f'),(7,null,'g'),(8,null,'h');
+# grow the table so the small lists below exercise the values-table rewrite
+# under opt_param('inlist_rewrite_threshold', 2); generated rows carry c1 in
+# {3,4,5} and c2='x' so every query below keeps a small result set
+insert into inlist_dedup_t
+select 1000 + a.d*1000 + b.d*100 + c.d*10 + d.d, (a.d*7 + b.d*3 + c.d + d.d) % 3 + 3, 'x'
+from digits a, digits b, digits c, digits d;
+
+################################
+# Duplicated constant IN-list members are redundant: the values table built
+# from a constant IN-list keeps one row per distinct member, so a duplicated
+# list must return exactly the same rows as the unique list.
+# opt_param('inlist_rewrite_threshold', 2) forces the values-table rewrite for
+# the small lists below; the last pair exceeds the default threshold of 1000.
+
+# duplicated vs unique IN members
+select /*+opt_param('inlist_rewrite_threshold', 2)*/ id, c1 from inlist_dedup_t where c1 in (1, 2, 1, 2, 1, 2, 1, 2) order by id;
+select /*+opt_param('inlist_rewrite_threshold', 2)*/ id, c1 from inlist_dedup_t where c1 in (1, 2) order by id;
+
+# duplicated NOT IN members with NULL, compared with the unique list
+select /*+opt_param('inlist_rewrite_threshold', 2)*/ id from inlist_dedup_t where c1 not in (1, 1, 1, 2, 2, 2, null, null) order by id;
+select /*+opt_param('inlist_rewrite_threshold', 2)*/ id from inlist_dedup_t where c1 not in (1, 2, null) order by id;
+
+# duplicated NOT IN members without NULL, compared with the unique list
+select /*+opt_param('inlist_rewrite_threshold', 2)*/ id from inlist_dedup_t where c1 not in (3, 3, 4, 4, 5, 5) order by id;
+select /*+opt_param('inlist_rewrite_threshold', 2)*/ id from inlist_dedup_t where c1 not in (3, 4, 5) order by id;
+
+# adjacent NOT IN lists merged into one list, then deduplicated
+select /*+opt_param('inlist_rewrite_threshold', 2)*/ id from inlist_dedup_t where c1 not in (3, 3) and c1 not in (4, 4) and c1 not in (5, 5) order by id;
+
+# string members with duplicated content
+select /*+opt_param('inlist_rewrite_threshold', 2)*/ id from inlist_dedup_t where c2 in ('a', 'a', 'b', 'a', 'b') order by id;
+select /*+opt_param('inlist_rewrite_threshold', 2)*/ id from inlist_dedup_t where c2 in ('a', 'b') order by id;
+
+# multi-column rows with duplicated rows
+select /*+opt_param('inlist_rewrite_threshold', 2)*/ id from inlist_dedup_t where (c1, c2) in ((1,'a'), (1,'a'), (2,'b'), (2,'b'), (4,'d')) order by id;
+select /*+opt_param('inlist_rewrite_threshold', 2)*/ id from inlist_dedup_t where (c1, c2) in ((1,'a'), (2,'b'), (4,'d')) order by id;
+
+# all members NULL
+select /*+opt_param('inlist_rewrite_threshold', 2)*/ id from inlist_dedup_t where c1 in (null, null, null) order by id;
+
+# textually different but value-equal members (int and decimal literals) are interchangeable
+select /*+opt_param('inlist_rewrite_threshold', 2)*/ id from inlist_dedup_t where c1 in (1, 1.0, 2, 2.0, 1.0) order by id;
+select /*+opt_param('inlist_rewrite_threshold', 2)*/ id from inlist_dedup_t where c1 in (1, 2) order by id;
+
+# default threshold: a 1020-member shuffled list with 2 distinct values takes the values-table rewrite without a hint
+select id from inlist_dedup_t where c1 in (
+  2, 1, 2, 2, 1, 1, 2, 1, 2, 1, 2, 2, 1, 2, 2, 2, 2, 2, 1, 1, 1, 1, 1, 2, 2, 2, 2, 1, 1, 2, 1,
+  2, 1, 1, 2, 1, 2, 1, 2, 2, 2, 2, 2, 1, 2, 1, 2, 2, 2, 2, 2, 1, 1, 1, 1, 2, 1, 1, 2, 2, 2, 1,
+  1, 1, 1, 2, 1, 2, 1, 2, 1, 1, 2, 2, 2, 2, 1, 1, 2, 1, 2, 2, 1, 2, 1, 1, 2, 1, 2, 1, 2, 2, 1,
+  1, 1, 1, 2, 1, 1, 1, 2, 1, 1, 2, 2, 1, 1, 1, 2, 1, 2, 1, 2, 2, 2, 1, 2, 1, 2, 1, 1, 2, 2, 2,
+  1, 1, 1, 1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 2, 2, 1, 2, 1, 2, 2, 2, 2, 1, 1, 1, 1, 2, 2, 2, 1, 1,
+  2, 1, 1, 2, 1, 2, 1, 1, 1, 1, 1, 1, 2, 1, 1, 2, 2, 1, 2, 2, 2, 1, 2, 1, 2, 1, 2, 1, 1, 1, 2,
+  1, 2, 1, 1, 1, 2, 2, 2, 1, 1, 1, 1, 1, 2, 2, 1, 2, 1, 1, 2, 1, 1, 2, 1, 1, 2, 1, 2, 2, 1, 1,
+  1, 1, 2, 1, 1, 1, 1, 2, 1, 2, 1, 1, 1, 1, 1, 2, 2, 2, 1, 2, 2, 1, 2, 2, 1, 2, 1, 2, 2, 1, 2,
+  2, 1, 2, 1, 1, 1, 2, 2, 2, 2, 1, 1, 2, 2, 1, 1, 1, 1, 2, 1, 2, 1, 1, 1, 2, 2, 2, 1, 1, 1, 2,
+  1, 2, 1, 2, 1, 1, 1, 1, 2, 1, 1, 1, 2, 1, 2, 2, 1, 1, 2, 1, 1, 2, 1, 1, 1, 2, 1, 1, 2, 2, 2,
+  1, 1, 2, 2, 2, 1, 2, 2, 2, 1, 2, 1, 1, 2, 2, 2, 2, 2, 2, 2, 1, 2, 2, 1, 1, 1, 2, 2, 2, 2, 2,
+  2, 1, 2, 2, 2, 1, 1, 1, 1, 2, 1, 1, 1, 1, 2, 1, 1, 2, 2, 2, 1, 1, 1, 2, 1, 2, 1, 2, 2, 1, 2,
+  1, 2, 2, 2, 1, 1, 1, 2, 2, 1, 1, 2, 2, 2, 1, 1, 2, 1, 2, 1, 2, 1, 1, 1, 1, 1, 2, 1, 1, 2, 2,
+  2, 1, 2, 2, 2, 1, 1, 2, 1, 2, 1, 1, 2, 1, 2, 1, 2, 2, 2, 1, 2, 2, 2, 1, 2, 2, 1, 1, 1, 1, 2,
+  1, 1, 2, 1, 1, 2, 2, 1, 1, 1, 2, 2, 1, 2, 2, 2, 2, 2, 1, 2, 1, 2, 2, 1, 2, 1, 2, 1, 1, 2, 2,
+  2, 2, 2, 1, 1, 2, 2, 2, 2, 1, 2, 1, 2, 1, 1, 1, 2, 1, 2, 2, 2, 1, 2, 1, 2, 2, 1, 1, 1, 2, 1,
+  2, 2, 2, 1, 2, 1, 1, 1, 2, 2, 1, 2, 1, 1, 2, 2, 1, 2, 1, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 1, 1,
+  1, 2, 1, 2, 1, 1, 1, 1, 1, 1, 1, 2, 1, 1, 2, 1, 2, 2, 2, 1, 1, 2, 2, 1, 1, 1, 2, 2, 1, 1, 2,
+  2, 2, 2, 1, 1, 2, 2, 2, 2, 1, 2, 1, 2, 2, 1, 2, 1, 2, 1, 1, 2, 1, 1, 2, 2, 2, 1, 1, 2, 2, 2,
+  2, 1, 2, 1, 2, 1, 1, 2, 1, 1, 1, 2, 2, 1, 2, 2, 1, 2, 1, 2, 1, 1, 1, 2, 2, 1, 2, 1, 2, 1, 2,
+  1, 2, 1, 1, 1, 1, 2, 2, 2, 1, 1, 1, 1, 2, 2, 2, 2, 2, 2, 2, 2, 1, 1, 2, 2, 2, 2, 1, 2, 2, 1,
+  2, 1, 2, 1, 2, 2, 2, 2, 1, 1, 2, 2, 1, 1, 2, 2, 2, 2, 1, 2, 2, 2, 2, 2, 2, 2, 1, 2, 1, 2, 1,
+  1, 1, 1, 1, 2, 2, 2, 1, 1, 1, 2, 2, 1, 2, 1, 1, 1, 1, 1, 2, 1, 2, 2, 1, 1, 2, 1, 1, 2, 2, 2,
+  2, 2, 1, 2, 1, 1, 2, 1, 1, 2, 1, 1, 2, 2, 1, 1, 1, 2, 1, 2, 2, 2, 2, 1, 2, 1, 2, 1, 1, 2, 2,
+  1, 1, 1, 1, 1, 2, 2, 2, 2, 1, 1, 2, 1, 2, 2, 1, 1, 1, 1, 2, 2, 1, 2, 1, 1, 2, 1, 2, 2, 1, 2,
+  2, 2, 2, 2, 1, 1, 2, 1, 1, 1, 2, 2, 2, 2, 2, 1, 1, 2, 1, 1, 1, 1, 2, 2, 1, 2, 1, 1, 2, 2, 1,
+  1, 1, 2, 1, 2, 2, 2, 2, 1, 2, 2, 2, 2, 1, 1, 1, 1, 1, 2, 2, 2, 2, 2, 2, 1, 1, 1, 2, 2, 2, 1,
+  1, 2, 1, 1, 1, 1, 1, 2, 1, 2, 2, 2, 2, 2, 2, 2, 1, 1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 1, 1, 1, 2,
+  2, 2, 2, 1, 1, 1, 2, 2, 1, 1, 1, 2, 2, 2, 1, 1, 2, 1, 1, 1, 2, 2, 1, 2, 2, 1, 1, 1, 1, 1, 1,
+  1, 2, 2, 2, 1, 2, 2, 1, 1, 2, 2, 2, 1, 2, 1, 2, 1, 2, 1, 1, 2, 1, 1, 2, 2, 1, 1, 1, 1, 2, 1,
+  2, 2, 2, 1, 1, 2, 1, 2, 1, 1, 2, 2, 2, 2, 1, 2, 1, 2, 2, 2, 1, 1, 2, 2, 2, 2, 1, 1, 1, 2, 1,
+  2, 1, 1, 2, 2, 1, 2, 2, 2, 1, 1, 2, 1, 2, 1, 1, 1, 1, 1, 1, 2, 2, 1, 2, 2, 1, 2, 1, 1, 2, 2,
+  1, 2, 1, 2, 1, 1, 1, 1, 2, 2, 1, 1, 1, 2, 2, 1, 1, 2, 2, 1, 2, 1, 2, 1, 1, 1, 1, 1
+) order by id;
+select id from inlist_dedup_t where c1 in (1, 2) order by id;
+
+drop table inlist_dedup_t;
+drop table digits;

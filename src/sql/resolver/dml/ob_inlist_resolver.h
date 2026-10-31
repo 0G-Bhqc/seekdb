@@ -118,6 +118,7 @@ private:
                               ObInListsResolverHelper &helper,
                               const ParseNode *root_node,
                               const ParseNode *&ret_node);
+  static int dedup_const_values_table_rows(ObValuesTableDef &table_def);
   int resolve_values_table_from_inlist(const ParseNode *in_list,
                                        const int64_t column_cnt,
                                        const int64_t row_cnt,
